@@ -1,3 +1,169 @@
+import os
+import tempfile
+import win32com.client
+import numpy as np
+import pandas as pd
+import re
+
+def analyze_large_scsi_trace(trace_file_path: str, max_packets_to_export: int = 0):
+    """
+    Automates filtered export and streaming analysis of massive (32GB+) LeCroy traces.
+    
+    :param trace_file_path: Path to the .usb / .ut2 trace.
+    :param max_packets_to_export: 0 for all packets matching filter, or specify limit (e.g. 500000).
+    """
+    if not os.path.exists(trace_file_path):
+        raise FileNotFoundError(f"Trace file not found: {trace_file_path}")
+
+    print("Connecting to CATC.USBTracer COM server...")
+    app = win32com.client.Dispatch("CATC.USBTracer")
+
+    print(f"Opening large trace (this may take a few moments): {trace_file_path}")
+    doc = None
+    try:
+        doc = app.OpenFile(trace_file_path)
+    except Exception:
+        doc = app.OpenTrace(trace_file_path)
+
+    if not doc:
+        print("Failed to get document handle.")
+        return
+
+    # -------------------------------------------------------------
+    # 1. APPLY EXPORT FILTERS
+    # -------------------------------------------------------------
+    # LeCroy document COM interfaces support configuration flags/filters
+    # to exclude physical layer noise (Ordered Sets, LGOOD/LCRD, Polling).
+    print("Configuring trace export filters for SCSI/Mass Storage traffic...")
+    
+    # Attempt to suppress low-level USB 3 link/phy traffic if supported by the build
+    try:
+        # Hide link packets and training sequences
+        doc.SetFilterOptions(
+            IncludeLinkPackets=False,
+            IncludeOrderedSets=False,
+            IncludeITP=False
+        )
+    except Exception:
+        # Fallback: Certain COM versions configure filters via display settings
+        pass
+
+    temp_export = os.path.join(tempfile.gettempdir(), "scsi_traffic_filtered.txt")
+    if os.path.exists(temp_export):
+        os.remove(temp_export)
+
+    print(f"Exporting filtered SCSI events to: {temp_export}")
+
+    # -------------------------------------------------------------
+    # 2. TRIGGER FILTERED EXPORT
+    # -------------------------------------------------------------
+    # Flags for LeCroy ExportToText (Format options: 0=Default, 1=Summary/Transactions only)
+    # Passing specific export flags minimizes output to SCSI/Transfer level.
+    try:
+        # Try exporting at the SCSI/Transfer level instead of raw Packet level
+        # Signature: doc.ExportToText(FilePath, StartPacket, EndPacket, Level/FilterFlags)
+        if max_packets_to_export > 0:
+            doc.ExportToText(temp_export, 0, max_packets_to_export, 2)  # 2 = Transfer/Transaction level
+        else:
+            doc.ExportToText(temp_export)
+    except TypeError:
+        # Fallback for older/newer method signatures
+        try:
+            doc.Export(temp_export, 0)
+        except Exception as e:
+            print(f"Export error: {e}")
+            doc.Close()
+            return
+
+    # Close the heavy trace in memory immediately after export completes
+    doc.Close()
+    print("Trace document closed from memory. Parsing exported data...")
+
+    # -------------------------------------------------------------
+    # 3. STREAMING PARSER (Constant Memory Footprint)
+    # -------------------------------------------------------------
+    # Matches: SCSI Opcode (READ, WRITE, SYNC CACHE, etc.) and execution latency / delta
+    scsi_regex = re.compile(
+        r"(READ\s*\(\d+\)|WRITE\s*\(\d+\)|SYNCHRONIZE\s*CACHE|INQUIRY|MODE\s*SENSE|REPORT\s*LUNS|UNMAP)"
+        r".*?(\d+(?:\.\d+)?)\s*(us|ms|ns|s)",
+        re.IGNORECASE
+    )
+
+    # In-memory dictionary grouping to eliminate Pandas dataframe expansion overhead
+    latency_data = {}
+
+    line_count = 0
+    with open(temp_export, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line_count += 1
+            # Skip non-relevant lines quickly before hitting regex
+            if not any(k in line for k in ["READ", "WRITE", "CACHE", "INQUIRY", "SCSI", "UASP"]):
+                continue
+
+            match = scsi_regex.search(line)
+            if match:
+                cmd_raw, dur_str, unit = match.groups()
+                cmd = cmd_raw.upper().strip()
+                dur = float(dur_str)
+                unit_lower = unit.lower()
+
+                # Normalize to microseconds (us)
+                if unit_lower == "ms":
+                    dur *= 1_000.0
+                elif unit_lower == "ns":
+                    dur /= 1_000.0
+                elif unit_lower == "s":
+                    dur *= 1_000_000.0
+
+                if cmd not in latency_data:
+                    latency_data[cmd] = []
+                latency_data[cmd].append(dur)
+
+    print(f"Processed {line_count:,} exported lines.")
+
+    # -------------------------------------------------------------
+    # 4. COMPUTE PERCENTILES
+    # -------------------------------------------------------------
+    if not latency_data:
+        print("No SCSI command timings identified. Check if SCSI decoding was active.")
+        if os.path.exists(temp_export):
+            os.remove(temp_export)
+        return
+
+    summary_rows = []
+    for cmd, latencies in latency_data.items():
+        arr = np.array(latencies, dtype=np.float64)
+        summary_rows.append({
+            "Command": cmd,
+            "Count": len(arr),
+            "Min (us)": f"{np.min(arr):.2f}",
+            "Avg (us)": f"{np.mean(arr):.2f}",
+            "p50 (us)": f"{np.percentile(arr, 50):.2f}",
+            "p90 (us)": f"{np.percentile(arr, 90):.2f}",
+            "p95 (us)": f"{np.percentile(arr, 95):.2f}",
+            "p99 (us)": f"{np.percentile(arr, 99):.2f}",
+            "Max (us)": f"{np.max(arr):.2f}"
+        })
+
+    df_summary = pd.DataFrame(summary_rows)
+    print("\n" + "="*95)
+    print(f" SCSI COMMAND LATENCY PERCENTILES: {os.path.basename(trace_file_path)}")
+    print("="*95)
+    print(df_summary.to_string(index=False))
+    print("="*95 + "\n")
+
+    # Clean up temporary exported file
+    if os.path.exists(temp_export):
+        os.remove(temp_export)
+
+if __name__ == "__main__":
+    # Update with your 32GB trace file path
+    LARGE_TRACE_FILE = r"C:\Traces\32GB_storage_workload.usb"
+    
+    # Optional: pass a packet limit like 1_000_000 for a rapid sample run
+    analyze_large_scsi_trace(LARGE_TRACE_FILE, max_packets_to_export=0)
+
+=================================================================================
 import win32com.client
 
 # Test the primary LeCroy USB automation ProgIDs

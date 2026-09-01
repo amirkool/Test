@@ -122,3 +122,122 @@ if __name__ == "__main__":
     # Specify your actual .usb / .ut2 trace path
     TRACE_PATH = r"C:\Traces\usb3_storage_test.usb"
     analyze_scsi_trace_via_com(TRACE_PATH)
+========================================================================================
+import os
+import tempfile
+import win32com.client
+import pandas as pd
+import numpy as np
+import re
+
+def analyze_scsi_trace_via_com(trace_file_path: str):
+    if not os.path.exists(trace_file_path):
+        raise FileNotFoundError(f"Trace file not found: {trace_file_path}")
+
+    print("Connecting to CATC.USBTracer COM server...")
+    app = win32com.client.Dispatch("CATC.USBTracer")
+    # REMOVED: app.Visible = True (Not supported by CATC.USBTracer)
+
+    print(f"Opening trace file: {trace_file_path}")
+    
+    # Try OpenFile / OpenTrace depending on software version
+    doc = None
+    try:
+        doc = app.OpenFile(trace_file_path)
+    except Exception:
+        try:
+            doc = app.OpenTrace(trace_file_path)
+        except Exception as e:
+            print(f"Failed to open trace document: {e}")
+            return
+
+    if not doc:
+        print("Error: Document handle returned None.")
+        return
+
+    # Prepare temporary output path
+    temp_dir = tempfile.gettempdir()
+    temp_export = os.path.join(temp_dir, "lecroy_scsi_export.txt")
+    if os.path.exists(temp_export):
+        os.remove(temp_export)
+
+    print(f"Exporting trace to temporary file: {temp_export}")
+    
+    # Perform text export
+    try:
+        doc.ExportToText(temp_export)
+    except AttributeError:
+        # Alternate API signature fallback
+        try:
+            doc.Export(temp_export, 0)  # 0: Text Format
+        except Exception as e:
+            print(f"Export failed: {e}")
+            doc.Close()
+            return
+
+    # Parse exported transaction latencies
+    records = []
+    pattern = re.compile(
+        r"(READ\s*\(\d+\)|WRITE\s*\(\d+\)|SYNCHRONIZE\s*CACHE|INQUIRY|MODE\s*SENSE|REPORT\s*LUNS).*?(\d+\.?\d*)\s*(us|ms|ns|s)",
+        re.IGNORECASE
+    )
+
+    with open(temp_export, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            match = pattern.search(line)
+            if match:
+                cmd_name, duration_val, unit = match.groups()
+                dur_us = float(duration_val)
+                unit_lower = unit.lower()
+                
+                if unit_lower == "ms":
+                    dur_us *= 1_000.0
+                elif unit_lower == "ns":
+                    dur_us /= 1_000.0
+                elif unit_lower == "s":
+                    dur_us *= 1_000_000.0
+
+                records.append({
+                    "Command": cmd_name.upper().strip(),
+                    "Latency_us": dur_us
+                })
+
+    # Close document
+    doc.Close()
+
+    if not records:
+        print("No SCSI command durations parsed. Verify that SCSI decoding is enabled in the trace export.")
+        return
+
+    # Calculate percentiles
+    df = pd.DataFrame(records)
+
+    print("\n" + "="*85)
+    print(f" SCSI COMMAND LATENCY SUMMARY: {os.path.basename(trace_file_path)}")
+    print("="*85)
+
+    summary = []
+    for cmd, group in df.groupby("Command"):
+        lat = group["Latency_us"].values
+        summary.append({
+            "Command": cmd,
+            "Count": len(lat),
+            "Min (us)": f"{np.min(lat):.2f}",
+            "Avg (us)": f"{np.mean(lat):.2f}",
+            "p50 (us)": f"{np.percentile(lat, 50):.2f}",
+            "p90 (us)": f"{np.percentile(lat, 90):.2f}",
+            "p95 (us)": f"{np.percentile(lat, 95):.2f}",
+            "p99 (us)": f"{np.percentile(lat, 99):.2f}",
+            "Max (us)": f"{np.max(lat):.2f}"
+        })
+
+    summary_df = pd.DataFrame(summary)
+    print(summary_df.to_string(index=False))
+    print("="*85 + "\n")
+
+    if os.path.exists(temp_export):
+        os.remove(temp_export)
+
+if __name__ == "__main__":
+    TRACE_PATH = r"C:\Traces\usb3_storage_test.usb"
+    analyze_scsi_trace_via_com(TRACE_PATH)

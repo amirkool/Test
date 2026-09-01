@@ -1,0 +1,12 @@
+import win32com.client
+
+# Test the primary LeCroy USB automation ProgIDs
+prog_ids = ["CATC.USBTracer", "CATC.AnalyzerAdapter", "USBProtocolSuite.Application"]
+
+for prog_id in prog_ids:
+    try:
+        app = win32com.client.Dispatch(prog_id)
+        print(f"[SUCCESS] Connected to LeCroy COM server using ProgID: {prog_id}")
+        break
+    except Exception as e:
+        print(f"[FAILED] {prog_id} -> {e}")
